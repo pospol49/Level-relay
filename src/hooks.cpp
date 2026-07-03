@@ -7,10 +7,21 @@
 #include "links.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <optional>
 
 using namespace geode::prelude;
+
+namespace {
+uint64_t g_playGeneration = 0;
+uint64_t g_switchToken = 0;
+uint64_t g_switchPlayGeneration = 0;
+int g_switchLevelID = 0;
+bool g_switching = false;
+void cancelplay(uint64_t generation);
+void cancelotherdownload(uint64_t generation);
+}
 
 class $modify(RelayPauseLayer, PauseLayer) {
     struct Fields {
@@ -25,17 +36,23 @@ class $modify(RelayPauseLayer, PauseLayer) {
 
 public:
     void refreshBtns();
+    int relayLevelID();
 };
 
 class $modify(RelayPlayLayer, PlayLayer) {
     struct Fields {
         std::optional<float> m_lastDeathX;
         std::optional<float> m_relayDeathX;
+        uint64_t m_relayGeneration = 0;
         StartPosObject* m_sp = nullptr;
         float m_spX = 0.f;
         bool m_seenSP = false;
         int m_spCount = 0;
         bool m_spSet = false;
+
+        ~Fields() {
+            cancelplay(m_relayGeneration);
+        }
     };
 
     void checkSP(GameObject* obj);
@@ -61,39 +78,158 @@ public:
     void destroyPlayer(PlayerObject* p, GameObject* obj);
 
     std::optional<float> lastDeathX();
+    uint64_t relayGeneration();
 };
 
 namespace relay {
     void reqswitch();
-    void reqswitch(RelayPauseLayer* pause);
 }
 
 namespace {
 std::optional<float> g_nextRelayDeathX;
 
-void switchtolvl(GJGameLevel* level, std::optional<float> deathX, RelayPauseLayer* pause) {
+bool sameplay(uint64_t generation, int levelID) {
+    auto pl = PlayLayer::get();
+    return pl && pl->m_level &&
+        geode::cast::modify_cast<RelayPlayLayer*>(pl)->relayGeneration() == generation &&
+        relay::levelKey(pl->m_level) == levelID;
+}
+
+void finishswitch(uint64_t token) {
+    if (token != g_switchToken) return;
+
+    g_switching = false;
+    g_switchPlayGeneration = 0;
+    g_switchLevelID = 0;
+}
+
+bool currentswitch(uint64_t token, uint64_t generation, int levelID) {
+    return g_switching && token == g_switchToken &&
+        g_switchPlayGeneration == generation && g_switchLevelID == levelID &&
+        sameplay(generation, levelID);
+}
+
+RelayPauseLayer* currentpause(uint64_t generation, int levelID) {
+    if (!sameplay(generation, levelID)) return nullptr;
+
+    auto director = CCDirector::get();
+    auto scene = director ? director->getRunningScene() : nullptr;
+    auto node = scene ? scene->getChildByIDRecursive("relay-menu"_spr) : nullptr;
+    auto menu = typeinfo_cast<CCMenu*>(node);
+    auto pause = menu ? typeinfo_cast<PauseLayer*>(menu->getParent()) : nullptr;
+    if (!pause || pause->getChildByID("relay-menu"_spr) != menu) return nullptr;
+
+    auto relayPause = geode::cast::modify_cast<RelayPauseLayer*>(pause);
+    if (!relayPause || relayPause->relayLevelID() != levelID) return nullptr;
+    return relayPause;
+}
+
+void refreshpause(uint64_t generation, int levelID) {
+    if (auto pause = currentpause(generation, levelID)) pause->refreshBtns();
+}
+
+void switchtolvl(
+    GJGameLevel* level,
+    std::optional<float> deathX,
+    uint64_t token,
+    uint64_t generation,
+    int levelID
+) {
+    if (!level) {
+        log::warn("can't switch relay levels; target level is null");
+        finishswitch(token);
+        return;
+    }
+    if (!currentswitch(token, generation, levelID)) {
+        log::warn("cancelled stale relay switch to '{}'", level->m_levelName);
+        finishswitch(token);
+        return;
+    }
+
+    auto director = CCDirector::get();
+    if (!director || !director->getRunningScene()) {
+        log::warn("can't switch relay levels; no running scene");
+        finishswitch(token);
+        return;
+    }
+
     auto scene = CCScene::create();
+    if (!scene) {
+        log::error("couldn't build relay switch trampoline");
+        finishswitch(token);
+        return;
+    }
+
+    auto sceneRef = geode::Ref<CCScene>(scene);
+    auto delay = CCDelayTime::create(0.05f);
+    auto call = CallFuncExt::create([
+        level = geode::Ref<GJGameLevel>(level), deathX, token, sceneRef
+    ] {
+        if (!g_switching || token != g_switchToken) return;
+
+        auto director = CCDirector::get();
+        if (!director || !director->getRunningScene() ||
+            director->getRunningScene() != sceneRef.data()) {
+            log::warn("cancelled stale relay switch trampoline");
+            finishswitch(token);
+            return;
+        }
+        if (!level.data()) {
+            log::warn("can't switch relay levels; target level expired");
+            finishswitch(token);
+            return;
+        }
+
+        g_nextRelayDeathX = deathX;
+        auto ps = PlayLayer::scene(level.data(), false, false);
+        g_nextRelayDeathX.reset();
+
+        if (!ps) {
+            log::error("couldn't build PlayLayer for '{}'", level->m_levelName);
+            finishswitch(token);
+            return;
+        }
+
+        director = CCDirector::get();
+        if (!g_switching || token != g_switchToken || !director ||
+            director->getRunningScene() != sceneRef.data()) {
+            log::warn("relay switch scene changed while building PlayLayer");
+            finishswitch(token);
+            return;
+        }
+
+        auto transition = CCTransitionFade::create(0.5f, ps);
+        if (!transition) {
+            log::warn("couldn't build relay switch fade; using PlayLayer directly");
+        }
+
+        finishswitch(token);
+        director->replaceScene(transition ? transition : ps);
+    });
+    auto sequence = delay && call ? CCSequence::create(delay, call, nullptr) : nullptr;
+    if (!sequence) {
+        log::error("couldn't schedule relay switch trampoline");
+        finishswitch(token);
+        return;
+    }
 
     // PlayLayer::scene can crash while the old layer is still leaving
-    scene->runAction(CCSequence::create(
-        CCDelayTime::create(0.05f),
-        CallFuncExt::create([level = geode::Ref<GJGameLevel>(level), deathX] {
-            g_nextRelayDeathX = deathX;
-            auto ps = PlayLayer::scene(level.data(), false, false);
-            g_nextRelayDeathX.reset();
+    scene->runAction(sequence);
 
-            if (!ps) {
-                log::error("couldn't build PlayLayer for '{}'", level->m_levelName);
-                return;
-            }
+    if (!currentswitch(token, generation, levelID)) {
+        finishswitch(token);
+        return;
+    }
+    if (auto pause = currentpause(generation, levelID)) pause->onResume(nullptr);
 
-            CCDirector::get()->replaceScene(CCTransitionFade::create(0.5f, ps));
-        }),
-        nullptr
-    ));
-
-    if (pause) pause->onResume(nullptr);
-    CCDirector::sharedDirector()->replaceScene(scene);
+    director = CCDirector::get();
+    if (!director || !director->getRunningScene() ||
+        !currentswitch(token, generation, levelID)) {
+        log::warn("relay switch source changed before the trampoline");
+        finishswitch(token);
+        return;
+    }
+    director->replaceScene(scene);
 }
 
 std::string cutname(std::string const& name, size_t maxLen = 18) {
@@ -104,24 +240,31 @@ std::string cutname(std::string const& name, size_t maxLen = 18) {
 
 class relaydl;
 relaydl* g_download = nullptr;
-relaydl* dropdl();
+relaydl* dropdl(relaydl* expected);
 
 class relaydl : public CCNode, public LevelDownloadDelegate {
     LinkedLevel m_target;
-    RelayPauseLayer* m_pause = nullptr;
     std::optional<float> m_deathX;
+    uint64_t m_token = 0;
+    uint64_t m_playGeneration = 0;
+    int m_levelID = 0;
     LevelDownloadDelegate* m_old = nullptr;
+    bool m_ownsDelegate = false;
 public:
     static relaydl* create(
         LinkedLevel const& target,
         std::optional<float> deathX,
-        RelayPauseLayer* pause
+        uint64_t token,
+        uint64_t playGeneration,
+        int levelID
     ) {
         auto ret = new relaydl();
         if (ret->init()) {
             ret->m_target = target;
             ret->m_deathX = deathX;
-            ret->m_pause = pause;
+            ret->m_token = token;
+            ret->m_playGeneration = playGeneration;
+            ret->m_levelID = levelID;
             ret->autorelease();
             return ret;
         }
@@ -134,11 +277,24 @@ public:
     }
 
     void start() {
+        if (!currentswitch(m_token, m_playGeneration, m_levelID)) {
+            log::warn("cancelled stale relay download for {}", m_target.id);
+            cancel();
+            return;
+        }
+
         auto gm = GameLevelManager::sharedState();
         if (!gm) {
-            auto hold = dropdl();
             log::warn("can't download relay target {}; no GameLevelManager", m_target.id);
-            if (hold) hold->release();
+            cancel();
+            return;
+        }
+        if (gm->m_levelDownloadDelegate) {
+            log::warn("can't download relay target {}; another delegate is active", m_target.id);
+            Notification::create(
+                "Another level download is already active.", NotificationIcon::Error, 2.f
+            )->show();
+            cancel();
             return;
         }
 
@@ -147,35 +303,82 @@ public:
             NotificationIcon::Info, 2.f
         )->show();
 
-        // gd only has one level download delegate, put the old one back when we're done
+        // only borrow gd's delegate slot while its empty
         m_old = gm->m_levelDownloadDelegate;
         gm->m_levelDownloadDelegate = this;
+        m_ownsDelegate = true;
+
+        // gd can finish a cached download before downloadLevel returns
+        [[maybe_unused]] auto self = geode::Ref<relaydl>(this);
         gm->downloadLevel(m_target.id, false, 0);
+
+        if (g_download == this && m_ownsDelegate &&
+            gm->m_levelDownloadDelegate != this) {
+            log::warn("relay download delegate changed while starting {}", m_target.id);
+            cancel();
+        }
     }
 
     void restore() {
+        if (!m_ownsDelegate) return;
+        m_ownsDelegate = false;
+
+        auto old = m_old;
+        m_old = nullptr;
         auto gm = GameLevelManager::sharedState();
         if (gm && gm->m_levelDownloadDelegate == this) {
-            gm->m_levelDownloadDelegate = m_old;
+            gm->m_levelDownloadDelegate = old;
+        } else if (gm) {
+            // another mod took the delegate, dont restore over it
+            log::warn("relay download delegate changed before restore");
         }
-        m_old = nullptr;
+    }
+
+    void cancel() {
+        [[maybe_unused]] auto self = geode::Ref<relaydl>(this);
+        restore();
+        auto hold = dropdl(this);
+        finishswitch(m_token);
+        if (hold) hold->release();
+    }
+
+    bool belongsTo(uint64_t generation) const {
+        return m_playGeneration == generation;
+    }
+
+    bool ownsDelegate() const {
+        auto gm = GameLevelManager::sharedState();
+        return m_ownsDelegate && gm && gm->m_levelDownloadDelegate == this;
     }
 
     void levelDownloadFinished(GJGameLevel* lvl) override {
         restore();
 
         if (!lvl) {
-            auto hold = dropdl();
+            auto hold = dropdl(this);
             log::warn("relay download came back null");
+            finishswitch(m_token);
+            if (hold) hold->release();
+            return;
+        }
+
+        auto hold = dropdl(this);
+        if (!currentswitch(m_token, m_playGeneration, m_levelID)) {
+            log::warn("ignored stale relay download for {}", m_target.id);
+            finishswitch(m_token);
+            if (hold) hold->release();
+            return;
+        }
+        if (relay::levelKey(lvl) != m_target.id) {
+            log::warn("ignored wrong relay download for {}", m_target.id);
+            finishswitch(m_token);
             if (hold) hold->release();
             return;
         }
 
         relay::seen(lvl);
-
-        auto hold = dropdl();
         log::info("downloaded relay target '{}' ({})", lvl->m_levelName, relay::levelKey(lvl));
-        switchtolvl(lvl, m_deathX, m_pause);
+        switchtolvl(lvl, m_deathX, m_token, m_playGeneration, m_levelID);
         if (hold) hold->release();
     }
 
@@ -183,22 +386,48 @@ public:
         restore();
         log::warn("couldn't download relay target {} ({})", m_target.id, res);
 
-        auto hold = dropdl();
+        auto hold = dropdl(this);
+        if (!currentswitch(m_token, m_playGeneration, m_levelID)) {
+            log::warn("ignored stale relay download failure for {}", m_target.id);
+            finishswitch(m_token);
+            if (hold) hold->release();
+            return;
+        }
+
+        finishswitch(m_token);
         auto msg = fmt::format("Couldn't download {}.", m_target.name);
-        FLAlertLayer::create("Can't Load Level", msg.c_str(), "OK")->show();
+        if (auto alert = FLAlertLayer::create("Can't Load Level", msg.c_str(), "OK")) {
+            alert->show();
+        } else {
+            log::error("couldn't show relay download failure popup");
+        }
         if (hold) hold->release();
     }
 };
 
-relaydl* dropdl() {
+relaydl* dropdl(relaydl* expected) {
     auto ret = g_download;
-    if (!ret) return nullptr;
+    if (!ret || ret != expected) return nullptr;
 
     // keep it alive until the download callback is completely done
     ret->retain();
     g_download = nullptr;
     ret->release();
     return ret;
+}
+
+void cancelplay(uint64_t generation) {
+    if (!g_download || !g_download->belongsTo(generation)) return;
+
+    log::debug("cancelled relay download for old PlayLayer");
+    g_download->cancel();
+}
+
+void cancelotherdownload(uint64_t generation) {
+    if (!g_download || g_download->belongsTo(generation)) return;
+
+    log::debug("cancelled relay download after PlayLayer changed");
+    g_download->cancel();
 }
 
 }
@@ -333,6 +562,7 @@ void RelayPauseLayer::onPair(CCObject*) {
     if (!pl || !pl->m_level) return;
 
     int id = this->m_fields->m_levelID;
+    auto playGeneration = geode::cast::modify_cast<RelayPlayLayer*>(pl)->relayGeneration();
 
     if (auto pair = relay::linkFor(id)) {
         auto const& other = *pair->other(id);
@@ -340,11 +570,11 @@ void RelayPauseLayer::onPair(CCObject*) {
             "Unlink Level",
             fmt::format("Unlink {} and {}?", this->m_fields->m_levelName, other.name),
             "Cancel", "Unlink",
-            [this, id](auto*, bool yes) {
-                if (!yes) return;
+            [id, playGeneration](auto*, bool yes) {
+                if (!yes || !sameplay(playGeneration, id)) return;
                 relay::unlinkLevel(id);
                 Notification::create("Link removed.", NotificationIcon::None, 2.f)->show();
-                this->refreshBtns();
+                refreshpause(playGeneration, id);
             }
         );
         return;
@@ -362,34 +592,73 @@ void RelayPauseLayer::onPair(CCObject*) {
 }
 
 void RelayPauseLayer::onSwitch(CCObject*) {
-    relay::reqswitch(this);
+    relay::reqswitch();
 }
 
 void relay::reqswitch() {
-    reqswitch(nullptr);
-}
-
-void relay::reqswitch(RelayPauseLayer* pause) {
     auto pl = PlayLayer::get();
-    if (!pl || !pl->m_level) return;
-
-    int id = relay::levelKey(pl->m_level);
-    auto link = relay::linkFor(id);
-    if (!link) {
-        Notification::create("This level isn't linked.", NotificationIcon::Error, 2.f)->show();
-        if (pause) pause->refreshBtns();
+    if (!pl || !pl->m_level) {
+        log::warn("can't switch relay levels; no active PlayLayer");
         return;
     }
 
-    LinkedLevel other = *link->other(id);
+    int id = relay::levelKey(pl->m_level);
+    auto playGeneration = geode::cast::modify_cast<RelayPlayLayer*>(pl)->relayGeneration();
+    if (g_download && (!g_download->belongsTo(playGeneration) ||
+        !g_download->ownsDelegate())) {
+        log::debug("cleared stale relay download before switching");
+        g_download->cancel();
+    }
 
-    auto doswitch = [pause, other] {
+    auto link = relay::linkFor(id);
+    if (!link) {
+        Notification::create("This level isn't linked.", NotificationIcon::Error, 2.f)->show();
+        refreshpause(playGeneration, id);
+        return;
+    }
+
+    auto otherLevel = link->other(id);
+    if (!otherLevel) {
+        log::error("relay link for {} has no other level", id);
+        return;
+    }
+    LinkedLevel other = *otherLevel;
+
+    auto doswitch = [other, id, playGeneration] {
+        if (!sameplay(playGeneration, id)) {
+            log::warn("cancelled relay switch; the active PlayLayer changed");
+            return;
+        }
+
+        if (g_switching) {
+            if (g_switchPlayGeneration == playGeneration && g_switchLevelID == id) {
+                Notification::create(
+                    "Already switching linked levels.", NotificationIcon::Info, 2.f
+                )->show();
+                return;
+            }
+
+            // a switch from an old PlayLayer must not finish in this one
+            ++g_switchToken;
+            g_switching = false;
+        }
+
+        auto token = ++g_switchToken;
+        g_switching = true;
+        g_switchPlayGeneration = playGeneration;
+        g_switchLevelID = id;
+
         log::debug("relay switch -> '{}' ({})", other.name, other.id);
 
         std::optional<float> deathX;
         auto pl = PlayLayer::get();
-        if (pl && Mod::get()->getSettingValue<bool>("autoSPSelect")) {
-            deathX = static_cast<RelayPlayLayer*>(pl)->lastDeathX();
+        if (!pl || !pl->m_level || !sameplay(playGeneration, id)) {
+            log::warn("cancelled relay switch; the active PlayLayer changed");
+            finishswitch(token);
+            return;
+        }
+        if (Mod::get()->getSettingValue<bool>("autoSPSelect")) {
+            deathX = geode::cast::modify_cast<RelayPlayLayer*>(pl)->lastDeathX();
         }
 
         bool dupe = false;
@@ -402,12 +671,14 @@ void relay::reqswitch(RelayPauseLayer* pause) {
 
                 if (g_download) {
                     Notification::create("Already loading a linked level.", NotificationIcon::Info, 2.f)->show();
+                    finishswitch(token);
                     return;
                 }
 
-                auto dl = relaydl::create(other, deathX, pause);
+                auto dl = relaydl::create(other, deathX, token, playGeneration, id);
                 if (!dl) {
                     log::warn("couldn't start relay download for {}", other.id);
+                    finishswitch(token);
                     return;
                 }
 
@@ -421,19 +692,21 @@ void relay::reqswitch(RelayPauseLayer* pause) {
                 ? fmt::format("There are multiple local levels named {}.", other.name)
                 : fmt::format("Can't find {}.", other.name);
 
+            finishswitch(token);
             geode::createQuickPopup(
                 "Can't Find Level", msg + "\n\nRemove link?", "Keep Link", "Remove Link",
-                [pause, id = other.id](auto*, bool remove) {
-                    if (!remove) return;
+                [id = other.id, sourceID = id, playGeneration, token](auto*, bool remove) {
+                    if (!remove || token != g_switchToken ||
+                        !sameplay(playGeneration, sourceID)) return;
                     relay::unlinkLevel(id);
-                    if (pause) pause->refreshBtns();
+                    refreshpause(playGeneration, sourceID);
                 }
             );
             return;
         }
 
         relay::seen(lvl);
-        switchtolvl(lvl, deathX, pause);
+        switchtolvl(lvl, deathX, token, playGeneration, id);
     };
 
     if (!Mod::get()->getSettingValue<bool>("confirmSwitch")) {
@@ -441,8 +714,13 @@ void relay::reqswitch(RelayPauseLayer* pause) {
         return;
     }
 
-    auto scene = CCDirector::get()->getRunningScene();
-    if (scene && scene->getChildByIDRecursive("relay-switch-confirm"_spr)) return;
+    auto director = CCDirector::get();
+    auto scene = director ? director->getRunningScene() : nullptr;
+    if (!scene) {
+        log::warn("can't show relay switch confirmation; no running scene");
+        return;
+    }
+    if (scene->getChildByIDRecursive("relay-switch-confirm"_spr)) return;
 
     auto popup = geode::createQuickPopup(
         "Switch Level",
@@ -452,10 +730,19 @@ void relay::reqswitch(RelayPauseLayer* pause) {
             if (yes) doswitch();
         }
     );
+    if (!popup) {
+        log::error("couldn't build relay switch confirmation");
+        return;
+    }
     popup->setID("relay-switch-confirm"_spr);
 }
 
+int RelayPauseLayer::relayLevelID() {
+    return this->m_fields->m_levelID;
+}
+
 bool RelayPlayLayer::init(GJGameLevel* lvl, bool replay, bool noObj) {
+    this->m_fields->m_relayGeneration = ++g_playGeneration;
     this->m_fields->m_relayDeathX = g_nextRelayDeathX;
     this->m_fields->m_sp = nullptr;
     this->m_fields->m_spX = -std::numeric_limits<float>::infinity();
@@ -464,6 +751,8 @@ bool RelayPlayLayer::init(GJGameLevel* lvl, bool replay, bool noObj) {
     this->m_fields->m_spSet = false;
 
     if (!PlayLayer::init(lvl, replay, noObj)) return false;
+
+    cancelotherdownload(this->m_fields->m_relayGeneration);
 
     // local sp copies can already have objs when init returns
     if (this->m_fields->m_relayDeathX && this->m_objects) {
@@ -601,4 +890,8 @@ void RelayPlayLayer::destroyPlayer(PlayerObject* p, GameObject* obj) {
 
 std::optional<float> RelayPlayLayer::lastDeathX() {
     return this->m_fields->m_lastDeathX;
+}
+
+uint64_t RelayPlayLayer::relayGeneration() {
+    return this->m_fields->m_relayGeneration;
 }
