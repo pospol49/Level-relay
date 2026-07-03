@@ -1,0 +1,58 @@
+{
+  "geode": "5.7.1",
+  "gd": {
+    "win": "2.2081",
+    "mac": "2.2081",
+    "android": "2.2081",
+    "ios": "2.2081"
+  },
+  "id": "pospol49.levelrelay",
+  "name": "Level Relay",
+  "version": "v1.0.0",
+  "developer": "Pospol49",
+  "description": "Link two levels and switch between them easily from the pause menu",
+  "tags": [
+    "offline",
+    "utility"
+  ],
+  "links": {},
+  "resources": {
+    "sprites": [
+      "resources/*.png"
+    ]
+  },
+  "settings": {
+    "enableSwitchKeybind": {
+      "name": "Enable Switch Keybind",
+      "description": "Turns on a configurable keybind so u can switch linked lvls without opening pause.",
+      "type": "bool",
+      "default": false
+    },
+    "switchKeybind": {
+      "name": "Switch Linked Level",
+      "description": "Switch to the lvl linked to the one ur playing rn.",
+      "type": "keybind",
+      "category": "gameplay",
+      "enable-if": "enableSwitchKeybind",
+      "default": []
+    },
+    "autoSPSelect": {
+      "name": "Auto SP Select",
+      "description": "When u switch after dying, pick the closest startpos at or before where u died.",
+      "type": "bool",
+      "default": false
+    },
+    "confirmSwitch": {
+      "name": "Confirm Before Switching",
+      "description": "Shows a yes/no popup before switching so u dont misclick.",
+      "type": "bool",
+      "default": false
+    },
+    "legacyButtons": {
+      "name": "Legacy Buttons",
+      "description": "Use the old text buttons instead of the new cleaner icons.",
+      "type": "bool",
+      "default": false
+    }
+  }
+}
