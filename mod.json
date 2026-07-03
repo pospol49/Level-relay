@@ -8,7 +8,7 @@
   },
   "id": "pospol49.levelrelay",
   "name": "Level Relay",
-  "version": "v1.0.0",
+  "version": "v1.1.0",
   "developer": "Pospol49",
   "description": "Link two levels and switch between them easily from the pause menu",
   "tags": [
